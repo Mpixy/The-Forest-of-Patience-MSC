@@ -37,6 +37,7 @@ DEFAULTS = {
     "jump_key": "alt",
     "left_key": "left",
     "right_key": "right",
+    "up_key": "up",
     "assist_hold_key": "caps lock",
     "calibrate_key": "f8",
     "overlay_key": "f9",
@@ -246,6 +247,8 @@ class Helper:
 
         branches = vision.find_branches(frame)
         scale = vision.scale_of(branches)
+        platforms = vision.merge_platforms(branches)
+        ropes = vision.find_ropes(frame)
         if self.phys is None and branches:
             self.phys = planner.Physics(scale)
             self.learner = planner.JumpLearner(self.phys)
@@ -254,31 +257,52 @@ class Helper:
         cur = target = plan = None
         if char and self.phys:
             x, feet, _ = char
-            cur = planner.standing_on(branches, x, feet, scale)
-            self.learner.feed(now, x, feet, grounded=cur is not None)
+            cur = planner.standing_on(platforms, x, feet, scale)
+            on_rope = any(abs(x - r.x) < 12 * scale and r.top - 10 * scale < feet < r.bottom + 30 * scale
+                          for r in ropes) and cur is None
+            # rope climbing is not a jump - don't learn physics from it
+            self.learner.feed(now, x, feet, grounded=cur is not None or on_rope)
             if cur:
-                moving = 0 if self.prev_x is None else np.sign(x - self.prev_x)
-                target = planner.pick_target(branches, cur, self.phys, scale, prefer_dir=int(moving))
-                if target:
+                target, plan = planner.pick_target(platforms, cur, self.phys, scale, ropes)
+                if plan:
                     latency = self.cfg["latency_ms"] / 1000 + 1 / self.cfg["fps"]
-                    plan = planner.plan_jump(cur, target, self.phys, scale, latency)
-            self.act(char, cur, plan, scale, now)
+                    plan["press_x"] = plan["takeoff_x"] - plan["direction"] * self.phys.vx * latency
+            self.act(char, cur, plan, scale, now, on_rope)
             self.prev_x = x
         else:
             self.keys.release_all()
 
-        self.draw(branches, char, cur, target, plan, scale)
+        self.draw(platforms, ropes, char, cur, target, plan, scale)
 
-    def act(self, char, cur, plan, scale, now):
+    def act(self, char, cur, plan, scale, now, on_rope=False):
         x = char[0]
         assist = keyboard.is_pressed(self.cfg["assist_hold_key"])
         if not assist and self.assisting:
             self.keys.release_all()
         self.assisting = assist
         jump_key = self.cfg["jump_key"]
+        up_key = self.cfg["up_key"]
         cooled = now - self.last_jump > 0.35
 
-        if cur is None:            # in the air: keep holding the same arrow, nothing to decide
+        if cur is None:
+            # on a rope: keep climbing (holding up at the top steps onto the platform).
+            # in the air: keep holding the same arrow (MapleStory has no air control anyway)
+            if assist and on_rope:
+                self.keys.walk(0)
+                self.keys.hold(up_key)
+            return
+        if up_key in self.keys.held and now - self.last_jump > 0.6:
+            self.keys.release(up_key)   # landed after a climb / missed grab
+        if assist and plan and plan.get("rope"):
+            # walk under the rope, then jump while holding up to grab it
+            if abs(x - plan["takeoff_x"]) > 5 * scale:
+                self.keys.walk(1 if plan["takeoff_x"] > x else -1)
+            else:
+                self.keys.walk(0)
+                if cooled:
+                    self.keys.hold(up_key)
+                    self.keys.tap(jump_key)
+                    self.last_jump = now
             return
         if not plan:
             if assist:
@@ -324,17 +348,23 @@ class Helper:
         return out
 
     # ---------- drawing ----------
-    def draw(self, branches, char, cur, target, plan, scale):
+    def draw(self, platforms, ropes, char, cur, target, plan, scale):
         c = self.canvas
         c.delete("all")
         if not self.overlay_on:
             return
         r = max(3, int(4 * scale))
-        for b in branches:
+        for b in platforms:
             c.create_line(b.left, b.top, b.right, b.top, fill="#00e5ff", width=2)
             c.create_line(b.cx, b.top - 10 * scale, b.cx, b.top + 6 * scale, fill="#ff2d2d", width=2)
             c.create_oval(b.cx - r, b.top - r, b.cx + r, b.top + r, fill="#ff2d2d", outline="")
-        if target:
+        for rp in ropes:
+            c.create_line(rp.x, rp.top, rp.x, rp.bottom, fill="#b388ff", width=2, dash=(6, 4))
+        if isinstance(target, vision.Rope):
+            c.create_line(target.x, target.top, target.x, target.bottom, fill="#ffd400", width=4)
+            c.create_text(target.x, target.bottom + 16 * scale, text="CLIMB", fill="#ffd400",
+                          font=("Segoe UI", max(9, int(10 * scale)), "bold"))
+        elif target:
             c.create_line(target.left, target.top, target.right, target.top, fill="#ffd400", width=4)
             c.create_text(target.cx, target.top - 22 * scale, text="NEXT", fill="#ffd400",
                           font=("Segoe UI", max(9, int(10 * scale)), "bold"))
@@ -342,10 +372,10 @@ class Helper:
             px = plan["takeoff_x"]
             color = "#39ff14" if plan["ok"] else "#ff8c00"
             c.create_line(px, cur.top - 40 * scale, px, cur.top + 4 * scale, fill=color, width=3)
-            d = plan["direction"]
-            pts = self.phys.arc(px, cur.top, d, rise_floor=cur.top - target.top)
-            for (x1, y1), (x2, y2) in zip(pts[::2], pts[1::2]):
-                c.create_line(x1, y1, x2, y2, fill=color, width=2)
+            if not plan.get("rope"):
+                pts = self.phys.arc(px, cur.top, plan["direction"], rise_floor=cur.top - target.top)
+                for (x1, y1), (x2, y2) in zip(pts[::2], pts[1::2]):
+                    c.create_line(x1, y1, x2, y2, fill=color, width=2)
         if char:
             x, feet, _ = char
             c.create_oval(x - r, feet - r, x + r, feet + r, outline="#ffffff", width=2)

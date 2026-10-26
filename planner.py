@@ -51,51 +51,72 @@ def standing_on(branches, x, feet, scale):
     return None
 
 
-def pick_target(branches, current, phys, scale, prefer_dir=0):
-    """Next branch to climb to: higher, reachable, closest. `prefer_dir` breaks ties (-1 left / 1 right)."""
-    best, best_cost = None, None
-    min_rise = 10 * scale
-    for b in branches:
-        if b is current:
-            continue
+def pick_target(platforms, current, phys, scale, ropes=(), feet=None):
+    """Best next step up: a higher platform we can land on, or a rope we can grab.
+
+    Returns (target, plan) - target is a platform or a vision.Rope - or (None, None).
+    """
+    best = (None, None, None)
+    for b in platforms:
         rise = current.top - b.top
-        if rise < min_rise or rise > phys.max_rise * 0.92:
+        if b is current or rise < 10 * scale or rise > phys.max_rise * 0.92:
             continue
-        t = phys.air_time(rise)
-        gap = abs(b.cx - current.cx)
-        # farthest we can travel: from the far edge of our branch at full air time
-        if gap > phys.vx * t + current.half + b.half:
+        plan = plan_jump(current, b, phys, scale)
+        if not plan or not plan["lands"]:
             continue
-        cost = gap + 0.5 * rise
-        if prefer_dir and (b.cx - current.cx) * prefer_dir < 0:
-            cost += 1000
-        if best is None or cost < best_cost:
-            best, best_cost = b, cost
-    return best
+        cost = 0.5 * abs(plan["land_x"] - plan["takeoff_x"]) - rise + (0 if plan["ok"] else 40 * scale)
+        if best[0] is None or cost < best[0]:
+            best = (cost, b, plan)
+    for r in ropes:
+        # rope must hang above our platform, go higher, and its end must be in jump reach
+        if not (current.left <= r.x <= current.right) or r.top >= current.top - 10 * scale:
+            continue
+        if r.bottom < current.top - phys.max_rise * 0.85:
+            continue
+        cost = -(current.top - r.top)
+        if best[0] is None or cost < best[0]:
+            best = (cost, r, dict(direction=0, takeoff_x=r.x, press_x=r.x, land_x=r.x, ok=True, lands=True, rope=True))
+    return best[1], best[2]
 
 
 def plan_jump(current, target, phys, scale, latency=0.0):
     """Where to press jump. Returns dict(direction, takeoff_x, press_x, land_x, ok).
 
-    direction 0 = straight up (target is right above). press_x includes your reaction / input latency.
+    Lands as close to the target's middle as the jump allows. direction 0 = straight up
+    (the target is right above - platforms can be jumped through from below).
+    press_x includes your reaction / input latency.
     """
     rise = current.top - target.top
     t = phys.air_time(rise)
     if t is None:
         return None
-    gap = target.cx - current.cx
     reach = phys.vx * t
-    if abs(gap) < 6 * scale:
-        return dict(direction=0, takeoff_x=target.cx, press_x=target.cx, land_x=target.cx, ok=True)
-    d = 1 if gap > 0 else -1
-    takeoff = target.cx - d * reach
-    # can't take off outside our own branch - clamp, and say if we still land on the target
-    margin = 3 * scale
-    clamped = min(max(takeoff, current.left + margin), current.right - margin)
-    land = clamped + d * reach
-    ok = abs(land - target.cx) <= target.half - 2 * scale
-    press = clamped - d * phys.vx * latency
-    return dict(direction=d, takeoff_x=clamped, press_x=press, land_x=land, ok=ok)
+    m_from = 3 * scale                      # stay this far from our own edge
+    m_to = min(target.half * 0.3, 12 * scale)   # land at least this far inside the target
+    lo, hi = current.left + m_from, current.right - m_from
+    tlo, thi = target.left + m_to, target.right - m_to
+
+    # straight up: our platform reaches under the target
+    olo, ohi = max(lo, tlo), min(hi, thi)
+    if olo <= ohi:
+        x = min(max(target.cx, olo), ohi)
+        return dict(direction=0, takeoff_x=x, press_x=x, land_x=x, ok=True, lands=True)
+
+    d = 1 if target.cx > current.cx else -1
+    # landing interval reachable with a walking jump, intersected with the safe part of the target
+    if d < 0:
+        llo, lhi = max(lo - reach, tlo), min(hi - reach, thi)
+    else:
+        llo, lhi = max(lo + reach, tlo), min(hi + reach, thi)
+    if llo <= lhi:
+        land = min(max(target.cx, llo), lhi)
+        ok = True
+    else:   # can't land safely - best effort from our edge
+        land = (hi if d > 0 else lo) + d * reach
+        ok = False
+    takeoff = land - d * reach
+    return dict(direction=d, takeoff_x=takeoff, press_x=takeoff - d * phys.vx * latency, land_x=land, ok=ok,
+                lands=target.left <= land <= target.right)
 
 
 class JumpLearner:

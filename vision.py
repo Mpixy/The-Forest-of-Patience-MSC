@@ -64,6 +64,73 @@ def find_branches(bgr, ignore=()):
     return out
 
 
+def merge_platforms(branches):
+    """Step 2 has rows of 3-4 logs = one wide platform. Merge neighbours on the same height."""
+    bands = []   # logs on (almost) the same height
+    for b in sorted(branches, key=lambda b: b.top):
+        if bands and b.top - bands[-1][-1].top <= 0.3 * b.disk:
+            bands[-1].append(b)
+        else:
+            bands.append([b])
+    rows = []    # split each height band where the logs stop touching
+    for band in bands:
+        band.sort(key=lambda b: b.cx)
+        rows.append([band[0]])
+        for b in band[1:]:
+            if b.cx - rows[-1][-1].cx <= 2.8 * b.disk:   # a log or two may be missed
+                rows[-1].append(b)
+            else:
+                rows.append([b])
+    # a long floor cut in two by a game window (toolbar) is still one floor
+    joined = []
+    for row in rows:
+        prev = joined[-1] if joined else None
+        if prev and len(prev) >= 4 and len(row) >= 4 and abs(prev[-1].top - row[0].top) <= 0.3 * row[0].disk:
+            prev.extend(row)
+        else:
+            joined.append(row)
+    rows = joined
+    out = []
+    for row in rows:
+        if len(row) == 1:
+            out.append(row[0])
+            continue
+        left, right = row[0].left, row[-1].right
+        top = float(np.median([b.top for b in row]))
+        out.append(Branch((left + right) / 2, top, (right - left) / 2, row[0].disk))
+    return out
+
+
+class Rope:
+    __slots__ = ("x", "top", "bottom")
+
+    def __init__(self, x, top, bottom):
+        self.x, self.top, self.bottom = x, top, bottom
+
+    def __repr__(self):
+        return f"Rope(x={self.x:.0f}, {self.top:.0f}..{self.bottom:.0f})"
+
+
+ROPE_HSV_LO = (55, 190, 110)
+ROPE_HSV_HI = (70, 255, 255)
+
+
+def find_ropes(bgr):
+    """Climbable green vines: long, thin, vertical, bright green."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, ROPE_HSV_LO, ROPE_HSV_HI)
+    m = cv2.dilate(m, np.ones((1, 9), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((25, 1), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((120, 1), np.uint8))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(m)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if 10 <= w <= 40 and h >= 150 and area >= 8 * h:
+            out.append(Rope(x + w / 2, float(y), float(y + h)))
+    return out
+
+
 def scale_of(branches):
     """Screen scale vs. the reference resolution, from the median disk size."""
     if not branches:
